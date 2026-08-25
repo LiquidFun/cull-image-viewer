@@ -67,14 +67,24 @@ fn main() {
         );
     }
 
+    // Sizes and times come from the background stat pass at runtime (R23); run it inline
+    // here and report what it cost, since that is the number that dominates a cold launch.
+    let meta = scan::MetaStore::new();
+    let paths: Vec<_> = groups.iter().flat_map(|g| g.member_paths().cloned()).collect();
+    let t = std::time::Instant::now();
+    meta.fill(&paths);
+    println!("\nstat pass: {} files in {:?}", paths.len(), t.elapsed());
+
     println!("\nsidebar row preview (as the tree renders them):");
     for g in groups.iter().take(6) {
         println!(
             "  {:<20} {:<8}{:>9}  {}",
             g.stem,
             g.kind(),
-            scan::format_size(g.bytes()),
-            g.modified().map(scan::format_time).unwrap_or_else(|| "-".into()),
+            meta.group_bytes(g).map_or_else(|| "-".into(), scan::format_size),
+            meta.group_modified(g)
+                .map(scan::format_time)
+                .unwrap_or_else(|| "-".into()),
         );
     }
 

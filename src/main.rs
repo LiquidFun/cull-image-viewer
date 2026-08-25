@@ -20,9 +20,14 @@ use winit::event_loop::{ActiveEventLoop, ControlFlow, EventLoop};
 use winit::keyboard::{Key, NamedKey};
 use winit::window::{Window, WindowId};
 
-/// Sent by the prefetch ring when a decode finishes, so the event loop can collect it.
-#[derive(Debug, Clone, Copy)]
-struct Wake;
+/// Something happened off the main thread that the event loop should act on.
+enum Wake {
+    /// A decode finished and is waiting to be collected.
+    Decoded,
+    /// The library scan finished. Carries the tree, because scanning a large root can
+    /// take long enough to be the whole perceived launch and must not block the window.
+    Scanned(Vec<cull::scan::DirNode>),
+}
 
 /// Textures held on the GPU. One more than the prefetch window so the image being
 /// displayed is never the one evicted.
@@ -58,23 +63,15 @@ fn main() {
     // be in flight at once, so it never holds more than the pipeline already does.
     let pixels = Arc::new(cull::decode::BufferPool::new(MAX_IN_FLIGHT));
 
-    // Startup is phase-timed because the expensive part is machine-dependent -- the
-    // library scan is I/O bound and the GPU init is driver bound, and which dominates
-    // cannot be guessed. `RUST_LOG=info cull <dir>` prints the breakdown.
-    let t0 = std::time::Instant::now();
-    let app = App::new(
-        &root,
+    // No scan here: walking a large root (`~/Photos` rather than one shoot) takes long
+    // enough to be the whole perceived launch, and nothing about opening a window needs
+    // it. The tree arrives later as `Wake::Scanned`.
+    let app = App::empty(
         FileLoader::new(Arc::clone(&pixels)),
         Arc::new(SystemBin),
         DEFAULT_RADIUS,
         0,
     );
-    log::info!("startup: scanned {} images in {:?}", app.len(), t0.elapsed());
-    println!("{} images under {}", app.len(), root.display());
-    if app.is_empty() {
-        eprintln!("nothing to show");
-        std::process::exit(1);
-    }
 
     let event_loop: EventLoop<Wake> = match EventLoop::with_user_event().build() {
         Ok(el) => el,
@@ -91,10 +88,25 @@ fn main() {
     // hammer the ring's mutex and starve the very worker threads we are waiting on.
     event_loop.set_control_flow(ControlFlow::Wait);
     let proxy = event_loop.create_proxy();
+    let decode_proxy = proxy.clone();
     app.prefetch().set_waker(Arc::new(move || {
         // Failure just means the loop is shutting down.
-        let _ = proxy.send_event(Wake);
+        let _ = decode_proxy.send_event(Wake::Decoded);
     }));
+
+    // Scan on a worker so the window can come up immediately.
+    std::thread::spawn(move || {
+        let t = std::time::Instant::now();
+        let dirs = cull::scan::scan(&root);
+        let count: usize = dirs.iter().map(|d| d.groups.len()).sum();
+        log::info!("startup: scanned {count} images in {:?}", t.elapsed());
+        println!("{count} images under {}", root.display());
+        if count == 0 {
+            eprintln!("nothing to show under {}", root.display());
+        }
+        let _ = proxy.send_event(Wake::Scanned(dirs));
+    });
+
     let mut shell = Shell::new(app, pixels);
     if let Err(e) = event_loop.run_app(&mut shell) {
         eprintln!("event loop error: {e}");
@@ -579,11 +591,19 @@ impl ApplicationHandler<Wake> for Shell {
         }
     }
 
-    /// A decode finished. Upload it and redraw; no polling involved.
-    fn user_event(&mut self, _event_loop: &ActiveEventLoop, _event: Wake) {
-        if self.pump_uploads() {
-            if let Some(gfx) = self.gfx.as_ref() {
-                gfx.window.request_redraw();
+    /// Work finished off the main thread. No polling involved.
+    fn user_event(&mut self, _event_loop: &ActiveEventLoop, event: Wake) {
+        match event {
+            Wake::Decoded => {
+                if self.pump_uploads() {
+                    if let Some(gfx) = self.gfx.as_ref() {
+                        gfx.window.request_redraw();
+                    }
+                }
+            }
+            Wake::Scanned(dirs) => {
+                let e = self.app.adopt_scan(dirs);
+                self.apply(e);
             }
         }
     }

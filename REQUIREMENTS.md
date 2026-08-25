@@ -116,8 +116,12 @@ Linux-only paths (freedesktop trash, colord) without abstraction layers.
 
 ### Validated against the real tree
 
-`cargo run --release --bin scanrep` over 12 directories: **4287 files → 2109 groups in
-3 ms**, with every file accounted for and zero groups lacking a displayable member.
+`cargo run --release --bin scanrep` over 12 directories: **4287 files → 2109 groups**,
+with every file accounted for and zero groups lacking a displayable member.
+
+The scan itself does no I/O beyond `read_dir` — file sizes and timestamps are gathered
+separately and off the launch path, because stat'ing every file is what made a cold start
+take seconds. See R23.
 
 | shape | count | meaning |
 |-------|-------|---------|
@@ -540,8 +544,14 @@ user moved and the pool would only be holding memory for work nobody wants.
 
 > The image viewer takes a long time to start up. That should be really fast as well.
 
-**Status: WIP** — the structural fix is in; the remaining cost is machine-dependent and
-needs a measurement from the user's box.
+**Status: DONE** — launch is **~1 ms and independent of library size**. What remains
+before a *photo* appears is GPU driver init plus the first decode; see "What is left".
+
+> I want at least the application to open quicker than 100 ms, does not have to render an
+> image immediately.
+
+That distinction is what made this tractable: opening the window needs to know nothing
+about the library at all.
 
 `App::new` called `prefetch.set_centre(0)`, which queued the whole ±10 window — **11
 full-resolution decodes** — before the window was created and before wgpu had an adapter.
@@ -558,23 +568,81 @@ Also: the instance is created with `Backends::VULKAN` rather than `Instance::def
 probe-everything, so startup no longer spins up an EGL/GLX context purely to discard it.
 `WGPU_BACKEND` still overrides.
 
-### Measure before optimising further
+### The ~3 s launch was one `stat` per file
 
-Startup splits into phases whose costs are hardware- and driver-dependent, and this
-sandbox has no display, so guessing which dominates is exactly the mistake R21 punished
-three times. `RUST_LOG=info cull <dir>` now prints:
+Reported as "a long time to start when there are a lot of images, around 3 seconds", and
+the fact that it **scaled with image count** is what identified it. The whole pre-GPU
+startup measures **~10 ms** for 4320 files on a warm tmpfs, so nothing CPU-bound could
+account for seconds. The only work proportional to file count was `group_files` calling
+`std::fs::metadata` on every file: 4287 files at sub-millisecond each on a cold cache over
+85 GB is almost exactly the three seconds reported.
+
+Those stats fill two sidebar columns (size, capture time) and one confirmation message.
+None of it is needed to show a photo. So:
+
+- **`scan` no longer stats anything.** It is `read_dir` plus string work, proportional to
+  directories rather than files.
+- Sizes and times live in a `MetaStore`, filled by a background thread that starts *after*
+  the first frame — deferred rather than merely moved, because thousands of stats are I/O
+  bound and would otherwise queue against reading the first image off the same disk.
+- Rows show `-` until it lands. Arming a delete stats that one group directly, so the
+  confirmation always states what is going.
+- Keyed by path, not index, so a deletion shifting every later index cannot attach stale
+  sizes to the wrong rows.
+
+### And then the scan itself came off the path
+
+Even without the stats, the launch still waited for the whole tree to be walked. Reported
+as: `./cull ~/Photos/` takes about a second, while one shoot folder is instant — i.e. the
+cost tracked the size of the *root*, not of the shoot being viewed.
+
+Opening a window requires knowing nothing about the library, so `main` no longer scans.
+`App::empty` builds the app with no library at all and the window comes up immediately;
+the scan runs on a worker and arrives as `Wake::Scanned`, handled by `App::adopt_scan`.
+
+The prefetch radius is pinned to 0 until `warm_full_window` — so adopting a tree queues
+exactly one decode, not twenty — and the app must tolerate every input while empty, which
+it already did (R11 left it robust to a zero-length library).
+
+Measured on synthetic libraries (2 rayon threads, tmpfs — floors, not predictions):
+
+| phase | before | after |
+|---|---|---|
+| `scan`, 4320 files | 11 ms (incl. stats) | 4 ms, **off the launch path** |
+| `scan`, 24 000 files | 17 ms (incl. stats) | 17 ms, **off the launch path** |
+| stat pass, 24 000 files | on the launch path | 31 ms, **off it and parallel** |
+| **launch, 200 files** | — | **1 ms** |
+| **launch, 24 000 files** | — | **1 ms** |
+
+Launch is now flat in library size, which is the property that actually matters: it cannot
+regress as the library grows.
+
+Trade-offs, both deliberate:
+
+- The sidebar is empty and the status bar reads `scanning...` for as long as the walk
+  takes. On a cold `~/Photos` that is visible.
+- An empty or wrong directory no longer exits non-zero before the window opens; it opens a
+  window reporting no images, and prints to stderr. A GUI that has already drawn cannot
+  usefully `exit(1)`.
+
+### What is left, and how to measure it
+
+`RUST_LOG=info cull <dir>` prints:
 
 ```
 startup: scanned N images in ...
 startup: GPU adapter + device in ... (<adapter name>)
 startup: render pipeline in ...
+startup: stat'ed N files in ...
 startup: first image on screen ... after launch
 ```
 
-A synthetic 4320-file library scans in **~11 ms warm**, so the scan is unlikely to be the
-problem unless the real library is cold on slow storage — in which case the 4287
-`metadata()` calls, which exist only to show size and capture time in the sidebar, are the
-thing to defer.
+The window is up in ~1 ms, so anything remaining is GPU driver initialisation
+(not controllable) or the ~172 ms full-resolution decode of the first image. Getting a
+photo on screen inside 100 ms would need a **preview-first paint** — ARW carries a
+1616×1080 preview that decodes in ~10 ms (R9) — with the full-resolution texture swapped
+in behind it. Not built: it needs the renderer to keep showing the preview until the
+replacement is complete, and that is a render-path change this sandbox cannot test.
 
 ---
 
@@ -630,11 +698,11 @@ away disarms it again.
 
 ## Test coverage
 
-**191 tests, zero clippy warnings.**
+**194 tests, zero clippy warnings.**
 
 | suite | count | what it covers |
 |-------|-------|----------------|
-| unit (`--lib`) | 170 | TIFF/EXIF parsing, decode, buffer pooling, grouping, prefetch ring, startup warm-up, view maths, sidebar scroll maths, ICC, trash/undo, app state |
+| unit (`--lib`) | 173 | TIFF/EXIF parsing, decode, buffer pooling, grouping, prefetch ring, startup warm-up, view maths, sidebar scroll maths, ICC, trash/undo, app state |
 | `tests/sidebar_scroll.rs` | 6 | R21 through a real `egui::Context`: actual row rects inside the actual viewport, wheel scrolling, follow-on-move |
 | `tests/real_library.rs` | 11 | the real library: scan consistency, real decodes, RAW/JPEG agreement, ring warm-up, navigation, corrupt input |
 | `tests/shader.rs` | 4 | WGSL parses and validates via naga; entry points and bindings match `gpu.rs` |
@@ -667,12 +735,14 @@ and no surface each print a diagnostic and exit 1.
 
 ## Changelog
 
-- **Added R23 (fast startup).** `App::new` queued the entire ±10 window — 11 full-res
-  decodes, ~1.1 GB of fresh allocation on every core — *before* the window was created
-  and while the GPU driver was initialising. It now warms only the image it is about to
-  show and opens the ring after the first frame. The wgpu instance no longer probes every
-  backend. Added `RUST_LOG=info` startup phase timings, because which phase dominates is
-  driver-dependent and cannot be measured in the sandbox.
+- **Added R23 (fast startup): launch is now ~1 ms and flat in library size**, from seconds
+  on a large root. Three separate costs, all of which ran before the window was created:
+  one `stat` per file inside `scan` (4287 of them on a cold 85 GB library — the reason it
+  scaled with image count), the tree walk itself (`~/Photos` rather than one shoot), and a
+  full ±10 prefetch window of 11 decodes and ~1.1 GB of allocation. Sizes and timestamps
+  now come from a `MetaStore` filled behind the UI, the scan runs on a worker and arrives
+  as an event, and the ring warms one image until the first frame is up. The wgpu instance
+  no longer probes every backend, and `RUST_LOG=info` prints a phase breakdown.
 - **Delete is now plain `Delete`, not `Shift+Delete`** (R15), at the user's request. Still
   confirmed with `Enter`, still trashed rather than removed, still undoable.
 - **Fixed R21 for real, and added a headless egui layout suite.** Three bugs, not one:

@@ -11,7 +11,7 @@ use std::time::{Duration, Instant};
 
 use crate::icc;
 use crate::prefetch::{Loader, Prefetcher, State};
-use crate::scan::{self, DirNode, Group};
+use crate::scan::{self, DirNode, Group, MetaStore};
 use crate::trash::{self, Bin, History};
 use crate::view::{FitMode, Orientation, View, Viewport, ZOOM_STEP};
 
@@ -148,9 +148,14 @@ pub struct App {
     /// Whether the prefetch window has been opened to its full radius yet. Startup warms
     /// only the first image; see [`App::warm_full_window`].
     warmed: bool,
+    /// File sizes and timestamps, filled in on a background thread so the ~4300 stats
+    /// they need are not on the launch path (R23).
+    meta: Arc<MetaStore>,
 }
 
 impl App {
+    /// Scan `root` and build an app over it. Convenience for tests and tools; the real
+    /// program uses [`App::empty`] plus [`App::adopt_scan`] so the window does not wait.
     pub fn new<L: Loader>(
         root: &Path,
         loader: L,
@@ -158,11 +163,23 @@ impl App {
         radius: usize,
         threads: usize,
     ) -> Self {
-        let dirs = scan::scan(root);
-        let groups = scan::flatten(&dirs);
-        let paths = Self::display_paths(&groups);
-        let count = groups.len();
+        let mut app = Self::empty(loader, bin, radius, threads);
+        app.adopt_scan(scan::scan(root));
+        app
+    }
 
+    /// An app with no library yet.
+    ///
+    /// Scanning a large tree takes long enough to be the whole perceived launch — `~/Photos`
+    /// rather than one shoot — so it happens on a worker thread and the result arrives via
+    /// [`App::adopt_scan`]. Everything here is allocation-free bookkeeping plus spawning
+    /// the decode pool, so the window can be on screen in milliseconds.
+    pub fn empty<L: Loader>(
+        loader: L,
+        bin: Arc<dyn Bin>,
+        radius: usize,
+        threads: usize,
+    ) -> Self {
         // Leave a couple of cores for the UI thread and the GPU driver. Saturating every
         // core with decoders is what makes the window stop responding while a batch of
         // images loads.
@@ -172,19 +189,11 @@ impl App {
         } else {
             threads
         };
-        let prefetch = Prefetcher::new(paths, radius, threads, loader);
-        // Only the image that will actually be shown. `set_centre` here would queue the
-        // whole +/-10 window -- 21 full-resolution decodes, ~2 GB of fresh allocation --
-        // on every core, before the window exists and while the GPU driver is still
-        // initialising. `require` queues exactly one without moving the window, so the
-        // first frame is not competing with twenty it cannot display yet. The rest is
-        // warmed by `warm_full_window` once something is on screen.
-        prefetch.require(0);
 
-        let mut app = Self {
-            dirs,
-            groups,
-            prefetch,
+        Self {
+            dirs: Vec::new(),
+            groups: Vec::new(),
+            prefetch: Prefetcher::new(Vec::new(), radius, threads, loader),
             bin,
             history: History::new(UNDO_LIMIT),
             index: 0,
@@ -198,16 +207,41 @@ impl App {
             last_nav: None,
             fast_scroll: false,
             last_retarget: None,
-            status: format!("{count} images"),
+            status: "scanning...".into(),
             warmed: false,
-        };
-        // Lay the first image out from its header too. Without this `shown` stays None
-        // until the very first texture lands, so the view fits a 1x1 placeholder and
-        // then refits -- the visible jump R14 exists to remove, which every image
-        // except the first was already spared.
-        app.apply_probed_size(0);
-        app
+            meta: Arc::new(MetaStore::new()),
+        }
     }
+
+    /// Take the result of a background scan and start showing it.
+    pub fn adopt_scan(&mut self, dirs: Vec<DirNode>) -> Effects {
+        self.dirs = dirs;
+        self.groups = scan::flatten(&self.dirs);
+        self.index = 0;
+        self.shown = None;
+        self.probed.clear();
+        self.status = format!("{} images", self.groups.len());
+
+        // Narrow the window *before* handing over the paths: `reset` re-centres, and at
+        // full radius that would queue twenty decodes the user cannot see yet, competing
+        // with the one they can. `warm_full_window` opens it again once something is on
+        // screen.
+        self.prefetch.set_radius(0, 0);
+        self.prefetch
+            .reset(Self::display_paths(&self.groups), 0);
+        // Re-arm the deferred work, since none of it can have run without a library.
+        self.warmed = false;
+
+        // Lay the first image out from its header. Without this `shown` stays None until
+        // the very first texture lands, so the view fits a 1x1 placeholder and then
+        // refits -- the visible jump R14 exists to remove.
+        self.apply_probed_size(0);
+        Effects::moved().merged(Effects {
+            tree_changed: true,
+            ..Default::default()
+        })
+    }
+
 
     /// Display path per group. Groups without one are impossible by construction
     /// (`scan` drops them), but a placeholder keeps indices aligned if that changes.
@@ -293,6 +327,34 @@ impl App {
         });
     }
 
+    /// File sizes and capture times, for the sidebar columns.
+    pub fn meta(&self) -> &MetaStore {
+        &self.meta
+    }
+
+    /// Stat every file in the library on a background thread.
+    ///
+    /// One `stat` per file is cheap warm and brutal cold: on a large library it was the
+    /// entire ~3 s launch, because it ran to completion before the window was created.
+    /// Nothing needed to show a photo depends on it, so it now runs behind the UI and
+    /// rows show `-` until it lands.
+    fn spawn_meta_scan(&self) {
+        let paths: Vec<PathBuf> = self
+            .groups
+            .iter()
+            .flat_map(|g| g.member_paths().cloned())
+            .collect();
+        if paths.is_empty() {
+            return;
+        }
+        let meta = Arc::clone(&self.meta);
+        std::thread::spawn(move || {
+            let t = Instant::now();
+            meta.fill(&paths);
+            log::info!("startup: stat'ed {} files in {:?}", paths.len(), t.elapsed());
+        });
+    }
+
     /// Open the prefetch window to its full radius. Idempotent.
     ///
     /// Called once the first frame is on screen. Until then only the image being shown
@@ -303,7 +365,14 @@ impl App {
             return;
         }
         self.warmed = true;
+        // The radius is pinned to 0 until here, so this is what actually opens it.
+        self.prefetch.set_radius(self.radius, self.index);
         self.prefetch.set_centre(self.index);
+        // Deferred to here rather than to `App::new` for the same reason: thousands of
+        // stats are I/O bound, and firing them while the first image is still being read
+        // off the same disk would just queue behind each other. The sidebar's size and
+        // time columns are the least urgent thing in the program.
+        self.spawn_meta_scan();
     }
 
     /// Record the colour verdict once the real pixels exist.
@@ -548,11 +617,20 @@ impl App {
         match self.groups.get(self.index) {
             Some(g) => {
                 self.pending_delete = Some(self.index);
+                // Falls back to stat'ing this one group if the background pass has not
+                // reached it: the confirmation should always say how much is going, and
+                // a handful of stats for the group in front of the user is nothing.
+                let bytes = self.meta.group_bytes(g).unwrap_or_else(|| {
+                    g.member_paths()
+                        .filter_map(|p| std::fs::metadata(p).ok())
+                        .map(|m| m.len())
+                        .sum()
+                });
                 self.status = format!(
                     "delete {} ({} files, {})? Enter to confirm, Esc to cancel",
                     g.stem,
                     g.members.len(),
-                    crate::scan::format_size(g.bytes())
+                    crate::scan::format_size(bytes)
                 );
                 Effects::redraw()
             }
@@ -677,6 +755,10 @@ impl App {
             .min(self.groups.len().saturating_sub(1));
 
         self.rebuild_ring();
+        // A rescan follows an undo, so files have reappeared and need stat'ing. Not done
+        // after a plain delete: that only removes paths, and re-stat'ing the whole
+        // library on every cull would be far worse than the stale entries it avoids.
+        self.spawn_meta_scan();
         Effects::moved().merged(Effects {
             tree_changed: true,
             ..Default::default()
@@ -782,6 +864,68 @@ mod tests {
         assert_eq!(shown.index, 0);
         assert_eq!(shown.stored, (17, 9), "dimensions must come from the header");
         assert!(app.view.zoom > 0.0);
+    }
+
+    /// The window must be able to open before the library is known, because scanning a
+    /// large root is the whole perceived launch (R23).
+    #[test]
+    fn an_empty_app_is_usable_before_any_scan() {
+        let td = tempfile::tempdir().unwrap();
+        let bin = Arc::new(MemBin {
+            store: td.path().to_path_buf(),
+            moved: Mutex::new(Vec::new()),
+        });
+        let mut app = App::empty(StubLoader, bin, 3, 2);
+
+        assert!(app.is_empty());
+        assert!(app.current().is_none());
+        // Every input must be a safe no-op rather than a panic while we wait.
+        for a in [
+            Action::Next,
+            Action::Prev,
+            Action::Delete,
+            Action::ConfirmDelete,
+            Action::Undo,
+            Action::Fit,
+            Action::ActualSize,
+            Action::ToggleFitMode,
+        ] {
+            app.act(a);
+        }
+        app.zoom(1.0, (0.0, 0.0));
+        app.resize(800.0, 600.0);
+        app.warm_full_window();
+        assert!(app.is_empty());
+    }
+
+    #[test]
+    fn adopting_a_scan_populates_and_shows_the_first_image() {
+        let td = tempfile::tempdir().unwrap();
+        let photos = td.path().join("photos");
+        std::fs::create_dir_all(&photos).unwrap();
+        for i in 0..5 {
+            std::fs::write(photos.join(format!("IMG{i:04}.JPG")), TINY_JPEG).unwrap();
+        }
+        let bin = Arc::new(MemBin {
+            store: td.path().to_path_buf(),
+            moved: Mutex::new(Vec::new()),
+        });
+        let mut app = App::empty(StubLoader, bin, 3, 2);
+
+        let e = app.adopt_scan(crate::scan::scan(&photos));
+        assert!(e.tree_changed && e.image_changed);
+        assert_eq!(app.len(), 5);
+        assert_eq!(app.index(), 0);
+        // R14 still holds for the first image once the tree arrives.
+        assert_eq!(app.shown().unwrap().stored, (17, 9));
+        assert!(app.status.contains("5 images"));
+
+        // And the window still opens only after the first frame, not before.
+        app.prefetch().wait_idle();
+        assert_eq!(app.prefetch().state(3), State::Absent);
+        app.warm_full_window();
+        app.prefetch().wait_idle();
+        assert_ne!(app.prefetch().state(3), State::Absent);
     }
 
     /// Startup must not queue the whole window: 21 full-resolution decodes on every core
@@ -1303,6 +1447,9 @@ mod tests {
     #[test]
     fn fast_scroll_shrinks_then_restores_the_prefetch_window() {
         let (_td, mut app) = app_with(80);
+        // The ring stays pinned to the first image until a frame has been presented, so
+        // steady-state prefetch behaviour only exists after this.
+        app.warm_full_window();
         app.select(40);
         app.prefetch().wait_idle();
         // Full radius is 3 in these tests, so 37..=43 are warm.
@@ -1416,6 +1563,7 @@ mod tests {
     #[test]
     fn prefetch_window_follows_the_selection() {
         let (_td, mut app) = app_with(30);
+        app.warm_full_window();
         app.select(15);
         app.prefetch().wait_idle();
         // Radius 3, so 12..=18 are warm and the rest are not.

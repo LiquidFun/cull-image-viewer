@@ -14,7 +14,7 @@ use std::path::PathBuf;
 
 use crate::app::{Action, App};
 use crate::prefetch::State;
-use crate::scan::{format_size, format_time, DirNode, Group};
+use crate::scan::{format_size, format_time, DirNode, Group, MetaStore};
 
 /// What the user did in the UI this frame, plus the space left for the image.
 pub struct UiOutcome {
@@ -242,7 +242,7 @@ pub fn draw(
                         Row::Group { group, index } => {
                             let selected = *index == app.index();
                             let row_resp =
-                                row_label(ui, group, selected, failed.contains(index));
+                                row_label(ui, group, app.meta(), selected, failed.contains(index));
                             if selected {
                                 out.selected_row_rect = Some(row_resp.rect);
                             }
@@ -348,10 +348,22 @@ fn row_text(stem: &str, kind: &str, size: &str, when: &str) -> String {
 }
 
 /// One tree row: stem, kind, size and capture time.
-fn row_label(ui: &mut egui::Ui, group: &Group, selected: bool, failed: bool) -> egui::Response {
-    let size = format_size(group.bytes());
-    let when = group
-        .modified()
+///
+/// Size and time come from the background stat pass, so they show `-` for the moment
+/// after launch before it completes (R23). Only ~40 rows are drawn per frame, so the
+/// per-row lookups are a non-issue.
+fn row_label(
+    ui: &mut egui::Ui,
+    group: &Group,
+    meta: &MetaStore,
+    selected: bool,
+    failed: bool,
+) -> egui::Response {
+    let size = meta
+        .group_bytes(group)
+        .map_or_else(|| "-".into(), format_size);
+    let when = meta
+        .group_modified(group)
         .map(format_time)
         .unwrap_or_else(|| "-".into());
 

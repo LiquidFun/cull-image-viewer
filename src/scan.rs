@@ -13,6 +13,8 @@ use std::collections::HashMap;
 use std::path::{Path, PathBuf};
 use std::time::SystemTime;
 
+use rayon::prelude::*;
+
 /// Extensions we can display, best first. Lower index wins when a group has several.
 const DISPLAY_EXTS: &[&str] = &["jpg", "jpeg", "arw"];
 
@@ -31,10 +33,96 @@ pub struct Member {
     pub role: Role,
     /// Lowercased extension, for display-preference ranking.
     pub ext: String,
-    /// File size in bytes. Zero if the file vanished before we could stat it (R11).
+}
+
+/// Size and timestamp for one file.
+///
+/// Deliberately *not* part of [`Member`]. Filling these in requires one `stat` per file,
+/// and on a cold cache over a large library that dominates startup entirely: ~4300 files
+/// at sub-millisecond each is the ~3 s launch reported against R23. They feed two display
+/// columns and a confirmation message, none of which is needed to show the first photo,
+/// so they are gathered off the startup path -- see [`MetaStore`].
+#[derive(Clone, Copy, Debug, Default, PartialEq, Eq)]
+pub struct FileMeta {
+    /// Zero if the file vanished before we could stat it (R11).
     pub size: u64,
     /// Modification time. For camera files this is effectively capture time.
     pub modified: Option<SystemTime>,
+}
+
+/// Sizes and timestamps, gathered in the background after the window is up.
+///
+/// Keyed by path rather than index deliberately: deleting a group shifts every later
+/// index, and stale sizes attached to the wrong rows would be worse than absent ones.
+/// Until a path has been stat'ed its row simply shows `-`.
+#[derive(Default)]
+pub struct MetaStore {
+    map: std::sync::RwLock<HashMap<PathBuf, FileMeta>>,
+}
+
+impl MetaStore {
+    pub fn new() -> Self {
+        Self::default()
+    }
+
+    /// Stat every path and publish the result in one write.
+    ///
+    /// The whole batch is built locally first, so the UI never blocks on a writer
+    /// holding the lock, and the stats themselves run in parallel because each is a
+    /// blocking syscall that mostly waits.
+    pub fn fill(&self, paths: &[PathBuf]) {
+        let gathered: Vec<(PathBuf, FileMeta)> = paths
+            .par_iter()
+            .map(|p| {
+                let meta = std::fs::metadata(p).ok();
+                (
+                    p.clone(),
+                    FileMeta {
+                        size: meta.as_ref().map_or(0, |m| m.len()),
+                        modified: meta.as_ref().and_then(|m| m.modified().ok()),
+                    },
+                )
+            })
+            .collect();
+        let mut map = self.map.write().unwrap();
+        map.extend(gathered);
+    }
+
+    pub fn get(&self, path: &Path) -> Option<FileMeta> {
+        self.map.read().unwrap().get(path).copied()
+    }
+
+    /// Total bytes across a group, or `None` until its files have been stat'ed.
+    pub fn group_bytes(&self, group: &Group) -> Option<u64> {
+        let map = self.map.read().unwrap();
+        let mut total = 0;
+        let mut seen = false;
+        for m in &group.members {
+            if let Some(meta) = map.get(&m.path) {
+                total += meta.size;
+                seen = true;
+            }
+        }
+        seen.then_some(total)
+    }
+
+    /// Earliest modification time in a group, used as the capture time.
+    pub fn group_modified(&self, group: &Group) -> Option<SystemTime> {
+        let map = self.map.read().unwrap();
+        group
+            .members
+            .iter()
+            .filter_map(|m| map.get(&m.path).and_then(|f| f.modified))
+            .min()
+    }
+
+    pub fn len(&self) -> usize {
+        self.map.read().unwrap().len()
+    }
+
+    pub fn is_empty(&self) -> bool {
+        self.len() == 0
+    }
 }
 
 /// One navigable item: all files sharing a basename stem within a directory.
@@ -99,14 +187,9 @@ impl Group {
         }
     }
 
-    /// Total bytes across every file in the group, which is what deleting it reclaims.
-    pub fn bytes(&self) -> u64 {
-        self.members.iter().map(|m| m.size).sum()
-    }
-
-    /// Earliest modification time among members, used as the capture time.
-    pub fn modified(&self) -> Option<SystemTime> {
-        self.members.iter().filter_map(|m| m.modified).min()
+    /// Every file path in the group, for stat'ing in the background.
+    pub fn member_paths(&self) -> impl Iterator<Item = &PathBuf> {
+        self.members.iter().map(|m| &m.path)
     }
 }
 
@@ -190,8 +273,9 @@ where
     I: IntoIterator<Item = P>,
     P: AsRef<Path>,
 {
+    // Purely string work: no file is opened or stat'ed here, which is what keeps a scan
+    // proportional to `read_dir` rather than to the number of files (R23).
     let mut by_stem: HashMap<String, Vec<Member>> = HashMap::new();
-
     for f in files {
         let path = f.as_ref();
         let Some(name) = path.file_name().and_then(|n| n.to_str()) else {
@@ -201,14 +285,10 @@ where
         if stem.is_empty() {
             continue;
         }
-        // One stat per file. The whole scan of ~4300 files stays in single-digit ms.
-        let meta = std::fs::metadata(path).ok();
         by_stem.entry(stem).or_default().push(Member {
             path: path.to_path_buf(),
             role: role_for(&ext),
             ext,
-            size: meta.as_ref().map_or(0, |m| m.len()),
-            modified: meta.as_ref().and_then(|m| m.modified().ok()),
         });
     }
 
@@ -241,7 +321,9 @@ pub struct DirNode {
 ///
 /// Symlinked directories are not followed, to avoid cycles.
 pub fn scan(root: &Path) -> Vec<DirNode> {
-    let mut out = Vec::new();
+    // Phase 1: walk the tree. One `read_dir` per directory, and `file_type()` is served
+    // from the directory entry, so nothing here stats a file.
+    let mut listings: Vec<(PathBuf, Vec<PathBuf>)> = Vec::new();
     let mut stack = vec![root.to_path_buf()];
 
     while let Some(dir) = stack.pop() {
@@ -262,14 +344,22 @@ pub fn scan(root: &Path) -> Vec<DirNode> {
             }
         }
 
-        let groups = group_files(&dir, &files);
-        if !groups.is_empty() {
-            out.push(DirNode { path: dir, groups });
-        }
+        listings.push((dir, files));
         subdirs.sort();
         // Reversed, because popping a stack inverts order.
         stack.extend(subdirs.into_iter().rev());
     }
+
+    // Phase 2: stat and group, in parallel across directories. This is where a scan
+    // actually spends its time -- thousands of blocking stats (R23). Order does not
+    // matter because the result is sorted below, so the scan stays deterministic.
+    let mut out: Vec<DirNode> = listings
+        .into_par_iter()
+        .filter_map(|(dir, files)| {
+            let groups = group_files(&dir, &files);
+            (!groups.is_empty()).then_some(DirNode { path: dir, groups })
+        })
+        .collect();
 
     out.sort_by(|a, b| a.path.cmp(&b.path));
     out
@@ -446,23 +536,49 @@ mod tests {
 
     #[test]
     fn group_bytes_sums_every_member() {
-        // group_files stats real files, so write some with known sizes.
         let td = tempfile::tempdir().unwrap();
         let dir = td.path();
         std::fs::write(dir.join("x.JPG"), vec![0u8; 1000]).unwrap();
         std::fs::write(dir.join("x.ARW"), vec![0u8; 2500]).unwrap();
         let g = group_files(dir, [dir.join("x.JPG"), dir.join("x.ARW")]);
-        assert_eq!(g[0].bytes(), 3500);
-        assert!(g[0].modified().is_some());
+
+        let store = MetaStore::new();
+        let paths: Vec<PathBuf> = g[0].member_paths().cloned().collect();
+        store.fill(&paths);
+
+        assert_eq!(store.group_bytes(&g[0]), Some(3500));
+        assert!(store.group_modified(&g[0]).is_some());
+    }
+
+    /// Scanning must not touch the filesystem beyond `read_dir`, or startup is
+    /// proportional to the number of files rather than to the number of directories.
+    /// This is what made a cold launch take ~3 s on a large library (R23).
+    #[test]
+    fn grouping_reports_nothing_until_the_meta_pass_runs() {
+        let td = tempfile::tempdir().unwrap();
+        let dir = td.path();
+        std::fs::write(dir.join("x.JPG"), vec![0u8; 1000]).unwrap();
+        let g = group_files(dir, [dir.join("x.JPG")]);
+
+        let store = MetaStore::new();
+        assert!(store.is_empty(), "grouping must not have stat'ed anything");
+        assert_eq!(store.group_bytes(&g[0]), None, "unknown, not a wrong zero");
+        assert_eq!(store.group_modified(&g[0]), None);
+
+        store.fill(&[dir.join("x.JPG")]);
+        assert_eq!(store.group_bytes(&g[0]), Some(1000));
     }
 
     #[test]
-    fn missing_file_has_zero_size_and_no_time() {
+    fn missing_file_is_stat_ed_as_zero_not_a_panic() {
         // R11: stat fails for a path that vanished; must not panic or poison the group.
         let g = group_files(Path::new("/nonexistent"), [p("/nonexistent/z.JPG")]);
-        assert_eq!(g[0].bytes(), 0);
-        assert!(g[0].modified().is_none());
-        assert_eq!(format_size(g[0].bytes()), "-");
+        let store = MetaStore::new();
+        store.fill(&[p("/nonexistent/z.JPG")]);
+
+        assert_eq!(store.group_bytes(&g[0]), Some(0));
+        assert!(store.group_modified(&g[0]).is_none());
+        assert_eq!(format_size(0), "-");
     }
 
     #[test]
