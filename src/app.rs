@@ -105,6 +105,10 @@ pub enum Action {
     Skip(i64),
     First,
     Last,
+    /// First image in the directory holding the current one.
+    FirstInDir,
+    /// Last image in the directory holding the current one.
+    LastInDir,
     /// Trash the selected group.
     Delete,
     Undo,
@@ -470,6 +474,23 @@ impl App {
         }
     }
 
+    /// Inclusive index range of the directory holding the current image.
+    ///
+    /// `flatten` emits each directory's groups contiguously, so the run containing the
+    /// cursor is just the neighbours sharing its `dir`.
+    fn dir_bounds(&self) -> Option<(usize, usize)> {
+        let dir = &self.groups.get(self.index)?.dir;
+        let lo = self.groups[..self.index]
+            .iter()
+            .rposition(|g| g.dir != *dir)
+            .map_or(0, |i| i + 1);
+        let hi = self.groups[self.index..]
+            .iter()
+            .position(|g| g.dir != *dir)
+            .map_or(self.groups.len() - 1, |n| self.index + n - 1);
+        Some((lo, hi))
+    }
+
     fn step(&mut self, delta: i64) -> Effects {
         if self.groups.is_empty() {
             return Effects::default();
@@ -574,6 +595,14 @@ impl App {
             Action::Skip(n) => self.step(n),
             Action::First => self.select(0),
             Action::Last => self.select(self.groups.len().saturating_sub(1)),
+            Action::FirstInDir => match self.dir_bounds() {
+                Some((lo, _)) => self.select(lo),
+                None => Effects::default(),
+            },
+            Action::LastInDir => match self.dir_bounds() {
+                Some((_, hi)) => self.select(hi),
+                None => Effects::default(),
+            },
             Action::Delete => self.arm_delete(),
             Action::ConfirmDelete => self.confirm_delete(),
             Action::Cancel => {
@@ -989,6 +1018,95 @@ mod tests {
         let (_td, mut app) = app_with(3);
         app.note_colour(2, icc::Verdict::NotSrgb("Adobe RGB profile"));
         assert!(!app.shown().unwrap().colour.needs_warning());
+    }
+
+    /// Build a library of several directories, each with its own number of images.
+    fn app_with_dirs(counts: &[usize]) -> (tempfile::TempDir, App) {
+        let td = tempfile::tempdir().unwrap();
+        let photos = td.path().join("photos");
+        for (d, &n) in counts.iter().enumerate() {
+            let dir = photos.join(format!("shoot{d}"));
+            std::fs::create_dir_all(&dir).unwrap();
+            for i in 0..n {
+                std::fs::write(dir.join(format!("IMG{i:04}.JPG")), TINY_JPEG).unwrap();
+            }
+        }
+        let bin = Arc::new(MemBin {
+            store: td.path().to_path_buf(),
+            moved: Mutex::new(Vec::new()),
+        });
+        let app = App::new(&photos, StubLoader, bin, 3, 2);
+        (td, app)
+    }
+
+    /// `gg` and `G` are scoped to the directory in view, which is what makes them useful
+    /// while culling one shoot inside a tree of many. `Home`/`End` stay global.
+    #[test]
+    fn gg_and_capital_g_jump_within_the_current_directory() {
+        let (_td, mut app) = app_with_dirs(&[4, 5, 3]);
+        assert_eq!(app.len(), 12);
+
+        // Middle directory spans indices 4..=8.
+        app.select(6);
+        app.act(Action::FirstInDir);
+        assert_eq!(app.index(), 4);
+        app.act(Action::LastInDir);
+        assert_eq!(app.index(), 8);
+
+        // First directory, 0..=3.
+        app.select(2);
+        app.act(Action::LastInDir);
+        assert_eq!(app.index(), 3);
+        app.act(Action::FirstInDir);
+        assert_eq!(app.index(), 0);
+
+        // Last directory, 9..=11.
+        app.select(10);
+        app.act(Action::FirstInDir);
+        assert_eq!(app.index(), 9);
+        app.act(Action::LastInDir);
+        assert_eq!(app.index(), 11);
+
+        // And the global jumps still cross directories.
+        app.act(Action::First);
+        assert_eq!(app.index(), 0);
+        app.act(Action::Last);
+        assert_eq!(app.index(), 11);
+    }
+
+    #[test]
+    fn dir_jumps_are_idempotent_at_the_edges() {
+        let (_td, mut app) = app_with_dirs(&[3, 3]);
+        app.select(3);
+        app.act(Action::FirstInDir);
+        assert_eq!(app.index(), 3, "already first in its directory");
+        app.act(Action::LastInDir);
+        app.act(Action::LastInDir);
+        assert_eq!(app.index(), 5);
+    }
+
+    #[test]
+    fn dir_jumps_on_an_empty_library_are_no_ops() {
+        let td = tempfile::tempdir().unwrap();
+        let bin = Arc::new(MemBin {
+            store: td.path().to_path_buf(),
+            moved: Mutex::new(Vec::new()),
+        });
+        let mut app = App::empty(StubLoader, bin, 3, 2);
+        app.act(Action::FirstInDir);
+        app.act(Action::LastInDir);
+        assert_eq!(app.index(), 0);
+    }
+
+    /// A single-directory library is the common case; the whole list is one run.
+    #[test]
+    fn dir_jumps_span_the_whole_list_when_there_is_one_directory() {
+        let (_td, mut app) = app_with(6);
+        app.select(3);
+        app.act(Action::FirstInDir);
+        assert_eq!(app.index(), 0);
+        app.act(Action::LastInDir);
+        assert_eq!(app.index(), 5);
     }
 
     #[test]

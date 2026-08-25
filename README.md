@@ -1,21 +1,23 @@
 # cull
 
-A fast viewer for culling photo shoots. It shows one image at a time, keeps the
-neighbouring ones decoded in the background so navigation is instant, and deletes
-JPG+RAW pairs as a single unit.
+![](./media/showcase.png)
 
-It is deliberately not a photo manager — no tagging, ratings, editing or thumbnail
-database. Linux only, and it needs a Vulkan-capable GPU.
+A fast and simple photo-viewer for *cull*ing photo shoots. 
 
-## Building
+Features:
 
-```
-cargo build --release
-./target/release/cull ~/Photos/2026-lofoten
-```
+* Deletes JPG+RAW pairs together
+* Preloads +-10 images into GPU for VERY fast toggling of photos
+* Zoom+pan with mouse works as expected
+* Simple tree view of directories with image preload on mouse hover
+* X to switch between mode:keep-zoom and mode:refit so you can for example toggle between images in order to see zoomed in differences between adjacent images
 
-The directory is scanned recursively. Pointing it at a large root is fine; the window
-opens immediately and the tree fills in behind it.
+Probably only works on linux, needs a vulkan-capable graphics card.
+I did not find a photo viewer which gruop-deleted JPG+RAW and was fast (I like geeqie, but it's slow), so this is an attempt to solve that.
+
+## Installation
+
+Put the image viewer binary somewhere on your path (e.g. `~/.local/bin/`). Then run `cull .`
 
 ## How it works
 
@@ -36,7 +38,8 @@ one of them is a texture bind. Deletions go to the freedesktop trash and can be 
 | `→` `↓` `Space` | next image |
 | `←` `↑` | previous image |
 | `PgDn` `PgUp` | jump ten |
-| `Home` `End` | first, last |
+| `Home` `End` | first, last image overall |
+| `gg` `G` | first, last image in the current folder |
 | `Delete` | mark for deletion |
 | `Enter` | confirm it |
 | `Esc` | cancel, or quit if nothing is marked |
@@ -47,16 +50,18 @@ one of them is a texture bind. Deletions go to the freedesktop trash and can be 
 | wheel | zoom at the cursor |
 | left-drag | pan |
 
-Deleting takes two keystrokes on purpose. Everything goes to the trash and undo works,
-but it is still the one action with real consequences. Navigating away cancels a pending
-delete, so a stray `Enter` can't remove something you have already moved past.
+Deleting takes two keystrokes on purpose. Everything goes to the trash and undo works.
 
-Keep-zoom mode is for focus checking: the zoom level and pan position carry across image
-switches, so you can flick between two frames of the same subject at 100%.
+## Building
+
+```
+cargo build --release
+./target/release/cull ~/Photos/
+```
+
+The directory is scanned recursively. Pointing it at a large root is fine; the window
+opens immediately and the tree fills in behind it.
 
 ## Notes
 
 `RUST_LOG=info` prints startup and scan timings.
-
-`REQUIREMENTS.md` records the design decisions and the measurements behind them, including
-the ones that were tried and dropped.

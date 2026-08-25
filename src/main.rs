@@ -46,13 +46,12 @@ fn main() {
     std::sync::LazyLock::force(&LAUNCH);
     env_logger::Builder::from_env(env_logger::Env::default().default_filter_or("warn")).init();
 
-    let root = match std::env::args().nth(1) {
-        Some(p) => std::path::PathBuf::from(p),
-        None => {
-            eprintln!("usage: cull <directory>");
-            std::process::exit(2);
-        }
-    };
+    // No argument means the current directory: the usual way in is to cd into a shoot
+    // and run `cull`. `args_os` because this is a path -- `args` panics on a filename
+    // that is not valid UTF-8.
+    let root = std::env::args_os()
+        .nth(1)
+        .map_or_else(|| std::path::PathBuf::from("."), std::path::PathBuf::from);
     if !root.is_dir() {
         eprintln!("not a directory: {}", root.display());
         std::process::exit(2);
@@ -161,6 +160,8 @@ struct Shell {
     /// Whether a frame containing an actual photo has been presented yet, so the
     /// startup timing is logged once.
     first_image_shown: bool,
+    /// A `g` has been pressed and is waiting for its pair, for vim's `gg`.
+    pending_g: bool,
 }
 
 /// How long the pointer must rest on a row before it is preloaded.
@@ -182,6 +183,7 @@ impl Shell {
             tree_offset: 0.0,
             followed: None,
             first_image_shown: false,
+            pending_g: false,
         }
     }
 
@@ -345,7 +347,20 @@ impl Shell {
         }
     }
 
-    fn key_action(key: &Key) -> Option<Action> {
+    /// Map a keystroke to an action, tracking the half-typed `g` of vim's `gg`.
+    fn key_action(&mut self, key: &Key) -> Option<Action> {
+        // Any other key cancels a pending `g`, as in vim.
+        let had_g = std::mem::take(&mut self.pending_g);
+        if let Key::Character(c) = key {
+            if c.as_str() == "g" {
+                if had_g {
+                    return Some(Action::FirstInDir);
+                }
+                self.pending_g = true;
+                return None;
+            }
+        }
+
         Some(match key {
             Key::Named(NamedKey::ArrowRight | NamedKey::ArrowDown | NamedKey::Space) => {
                 Action::Next
@@ -366,6 +381,8 @@ impl Shell {
                 "f" | "F" => Action::Fit,
                 "z" | "Z" => Action::ActualSize,
                 "u" | "U" => Action::Undo,
+                // vim's gg/G, scoped to the current directory. Home/End stay global.
+                "G" => Action::LastInDir,
                 _ => return None,
             },
             _ => return None,
@@ -569,6 +586,7 @@ impl ApplicationHandler<Wake> for Shell {
                     return;
                 }
                 if event.logical_key == Key::Named(NamedKey::Escape) {
+                    self.pending_g = false;
                     // Escape backs out of an armed delete first; only quit if there is
                     // nothing pending, so it cannot both cancel and exit.
                     if self.app.delete_pending() {
@@ -579,7 +597,7 @@ impl ApplicationHandler<Wake> for Shell {
                     }
                     return;
                 }
-                if let Some(action) = Self::key_action(&event.logical_key) {
+                if let Some(action) = self.key_action(&event.logical_key) {
                     let e = self.app.act(action);
                     self.apply(e);
                 }

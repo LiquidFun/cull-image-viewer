@@ -679,7 +679,8 @@ collections, network/remote sources, thumbnail database, EXIF editor.
 | `→` `↓` `Space` | next image |
 | `←` `↑` | previous image |
 | `PgDn` / `PgUp` | jump 10 |
-| `Home` / `End` | first / last |
+| `Home` / `End` | first / last overall |
+| `gg` / `G` | first / last within the current directory |
 | **`Delete`** | arm delete (asks to confirm) |
 | **`Enter`** | confirm the armed delete |
 | `Esc` | cancel an armed delete, else quit |
@@ -698,11 +699,11 @@ away disarms it again.
 
 ## Test coverage
 
-**194 tests, zero clippy warnings.**
+**198 tests, zero clippy warnings.**
 
 | suite | count | what it covers |
 |-------|-------|----------------|
-| unit (`--lib`) | 173 | TIFF/EXIF parsing, decode, buffer pooling, grouping, prefetch ring, startup warm-up, view maths, sidebar scroll maths, ICC, trash/undo, app state |
+| unit (`--lib`) | 177 | TIFF/EXIF parsing, decode, buffer pooling, grouping, prefetch ring, startup warm-up, view maths, sidebar scroll maths, ICC, trash/undo, app state |
 | `tests/sidebar_scroll.rs` | 6 | R21 through a real `egui::Context`: actual row rects inside the actual viewport, wheel scrolling, follow-on-move |
 | `tests/real_library.rs` | 11 | the real library: scan consistency, real decodes, RAW/JPEG agreement, ring warm-up, navigation, corrupt input |
 | `tests/shader.rs` | 4 | WGSL parses and validates via naga; entry points and bindings match `gpu.rs` |
@@ -734,6 +735,10 @@ Startup failures degrade cleanly rather than panicking: no display, no adapter, 
 and no surface each print a diagnostic and exit 1.
 
 ## Changelog
+
+- Running with no argument opens the current directory, and `gg` / `G` jump to the first
+  and last image **within the current directory** (`Home` / `End` remain global). Scoping
+  them to the directory is what makes them useful in a tree of many shoots.
 
 - **Added R23 (fast startup): launch is now ~1 ms and flat in library size**, from seconds
   on a large root. Three separate costs, all of which ran before the window was created:
