@@ -1,0 +1,34 @@
+[package]
+name = "cull"
+version = "0.1.0"
+edition = "2021"
+
+[dependencies]
+bytemuck = "1.25.2"
+egui = "0.35.0"
+egui-wgpu = "0.35.0"
+egui-winit = "0.35.0"
+env_logger = "0.11.11"
+jpeg-decoder = "0.3.2"
+log = "0.4.33"
+memmap2 = "0.9"
+pollster = "1.0.1"
+rayon = "1"
+trash = "5.2.6"
+wgpu = "29.0"
+winit = "0.30.13"
+zune-core = "0.5.3"
+zune-jpeg = "0.5.15"
+
+[dev-dependencies]
+naga = { version = "30.0.1", features = ["wgsl-in"] }
+tempfile = "3.27.0"
+
+[profile.release]
+opt-level = 3
+codegen-units = 1
+lto = "thin"
+
+# The benchmark is a real workload, not a toy: never run it in debug.
+[profile.dev]
+opt-level = 1
